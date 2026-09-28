@@ -475,6 +475,7 @@ jobs:
           & $anydesk --version
 
 
+
       # ============================================================
       # 10. START ANYDESK SERVICE
       # ============================================================
@@ -483,78 +484,52 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-
           Write-Host ""
           Write-Host "======================================================"
           Write-Host "               ANYDESK SERVICE"
           Write-Host "======================================================"
-
-          $anydesk = $env:ANYDESK_PATH
-
-          if ([string]::IsNullOrWhiteSpace($anydesk)) {
-            throw "ANYDESK_PATH is not set."
+          $anydesk = "C:\Program Files (x86)\AnyDesk\AnyDesk.exe"
+          if (-not (Test-Path $anydesk)) {
+              throw "AnyDesk.exe not found."
           }
-
-          if (-not (Test-Path -LiteralPath $anydesk)) {
-            throw "AnyDesk executable not found: $anydesk"
-          }
-
-          Write-Host ""
-          Write-Host "AnyDesk:"
-          Write-Host $anydesk
-
-          Write-Host ""
-          Write-Host "Starting AnyDesk..."
-
+          # Start AnyDesk background service.
           & $anydesk --start
-
           Start-Sleep -Seconds 8
-
-          Write-Host ""
-          Write-Host "AnyDesk services:"
-
+          # Find AnyDesk service.
           $services = Get-Service |
             Where-Object {
               $_.Name -match "AnyDesk" -or
               $_.DisplayName -match "AnyDesk"
             }
-
           if (-not $services) {
-            throw "AnyDesk service was not found."
+              throw "AnyDesk service was not found."
           }
-
           foreach ($service in $services) {
-
-            Write-Host ""
-            Write-Host "Service: $($service.Name)"
-            Write-Host "Status:  $($service.Status)"
-
-            try {
-              Set-Service `
-                -Name $service.Name `
-                -StartupType Automatic
-            }
-            catch {
-              Write-Host "Could not set startup type."
-            }
-
-            if ($service.Status -ne "Running") {
-
+              Write-Host ""
+              Write-Host "Service:"
+              Write-Host $service.Name
               try {
-                Start-Service `
-                  -Name $service.Name `
-                  -ErrorAction Stop
-
-                Write-Host "Service started."
+                  Set-Service `
+                    -Name $service.Name `
+                    -StartupType Automatic
               }
               catch {
-                Write-Host "Could not start service: $($_.Exception.Message)"
+                  Write-Host "Could not set startup type."
               }
-            }
+              if ($service.Status -ne "Running") {
+                  try {
+                      Start-Service `
+                        -Name $service.Name `
+                        -ErrorAction SilentlyContinue
+                  }
+                  catch {
+                      Write-Host "Service is already starting."
+                  }
+              }
           }
-
           Write-Host ""
-          Write-Host "AnyDesk service configured."
+          Write-Host "AnyDesk service configured for automatic startup."
+
 
       # ============================================================
       # 11. CONFIGURE ANYDESK UNATTENDED ACCESS
