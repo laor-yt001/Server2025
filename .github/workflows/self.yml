@@ -5,7 +5,7 @@ on:
 
 jobs:
   secure-LaorORG:
-    runs-on: [self-hosted, Windows, LaorORG]
+    runs-on: self-hosted
 
     timeout-minutes: 3600
 
