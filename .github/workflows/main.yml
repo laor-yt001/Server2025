@@ -8,7 +8,7 @@ jobs:
 
   secure-LaorORG:
 
-    runs-on: windows-2022
+    runs-on: windows-latest
 
     # This keeps the current GitHub-hosted VM alive.
     # It does NOT make the GitHub VM permanent.
