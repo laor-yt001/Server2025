@@ -59,14 +59,16 @@ jobs:
             -Value 1 `
             -Force
 
-          # Configure TermService
+          # Configure Remote Desktop service
           Set-Service `
             -Name 'TermService' `
             -StartupType Automatic
 
-          Start-Service -Name 'TermService'
+          if ((Get-Service -Name 'TermService').Status -ne 'Running') {
+              Start-Service -Name 'TermService'
+          }
 
-          # Enable built-in Remote Desktop firewall rules
+          # Enable Windows Firewall RDP rules
           Enable-NetFirewallRule `
             -DisplayGroup 'Remote Desktop'
 
@@ -85,61 +87,102 @@ jobs:
           $username = "runneradmin"
 
           if ([string]::IsNullOrWhiteSpace($env:RUNNERADMIN_PASSWORD)) {
-              Write-Error "RUNNERADMIN_PASSWORD GitHub secret is not configured."
+              Write-Error "RUNNERADMIN_PASSWORD GitHub Secret is not configured."
               exit 1
           }
 
+          # --------------------------------------------------------
           # Verify account exists
+          # --------------------------------------------------------
           $user = Get-LocalUser `
             -Name $username `
             -ErrorAction SilentlyContinue
 
           if (-not $user) {
               Write-Error "Windows user '$username' does not exist."
-              Write-Error "Create the account on the Windows machine first."
+              Write-Error "Create runneradmin on the Windows machine first."
               exit 1
           }
 
-          # Set password from GitHub Secret
-          $securePassword = ConvertTo-SecureString `
-            $env:RUNNERADMIN_PASSWORD `
-            -AsPlainText `
-            -Force
+          Write-Host "Found Windows account: $username"
 
+          # --------------------------------------------------------
+          # Create SecureString WITHOUT ConvertTo-SecureString
+          # --------------------------------------------------------
+          # This avoids the Microsoft.PowerShell.Security module
+          # loading problem seen on this runner.
+          # --------------------------------------------------------
+          $securePassword = New-Object System.Security.SecureString
+
+          foreach ($char in $env:RUNNERADMIN_PASSWORD.ToCharArray()) {
+              $securePassword.AppendChar($char)
+          }
+
+          $securePassword.MakeReadOnly()
+
+          # --------------------------------------------------------
+          # Set password
+          # --------------------------------------------------------
           Set-LocalUser `
             -Name $username `
-            -Password $securePassword
+            -Password $securePassword `
+            -ErrorAction Stop
 
+          Write-Host "Password updated successfully."
+
+          # --------------------------------------------------------
           # Enable account
-          Enable-LocalUser -Name $username
+          # --------------------------------------------------------
+          Enable-LocalUser `
+            -Name $username `
+            -ErrorAction Stop
 
+          # --------------------------------------------------------
           # Password never expires
+          # --------------------------------------------------------
           Set-LocalUser `
             -Name $username `
-            -PasswordNeverExpires $true
+            -PasswordNeverExpires $true `
+            -ErrorAction Stop
 
-          # Add to Remote Desktop Users
+          # --------------------------------------------------------
+          # Add account to Remote Desktop Users
+          # --------------------------------------------------------
           $memberExists = Get-LocalGroupMember `
             -Group "Remote Desktop Users" `
             -ErrorAction SilentlyContinue |
             Where-Object {
-              $_.Name -match "\\$([regex]::Escape($username))$"
+                $_.Name -match "\\$([regex]::Escape($username))$"
             }
 
           if (-not $memberExists) {
+
+              Write-Host "Adding $username to Remote Desktop Users..."
+
               Add-LocalGroupMember `
                 -Group "Remote Desktop Users" `
-                -Member $username
+                -Member $username `
+                -ErrorAction Stop
+          }
+          else {
+              Write-Host "$username is already a member of Remote Desktop Users."
           }
 
-          # Verify without displaying password
-          $verify = Get-LocalUser -Name $username
+          # --------------------------------------------------------
+          # Verify account
+          # --------------------------------------------------------
+          $verify = Get-LocalUser `
+            -Name $username `
+            -ErrorAction Stop
 
-          Write-Host "Username: $($verify.Name)"
-          Write-Host "Enabled: $($verify.Enabled)"
-          Write-Host "Password expires: $($verify.PasswordExpires)"
+          Write-Host ""
+          Write-Host "=== runneradmin verification ==="
+          Write-Host "Username:         $($verify.Name)"
+          Write-Host "Enabled:          $($verify.Enabled)"
+          Write-Host "PasswordExpires:  $($verify.PasswordExpires)"
+          Write-Host ""
 
-          Write-Host "runneradmin configured."
+          Write-Host "runneradmin configured successfully."
 
       # ------------------------------------------------------------
       # 4. Install Tailscale
@@ -160,7 +203,13 @@ jobs:
 
               Invoke-WebRequest `
                 -Uri $url `
-                -OutFile $installer
+                -OutFile $installer `
+                -UseBasicParsing
+
+              if (-not (Test-Path $installer)) {
+                  Write-Error "Tailscale installer download failed."
+                  exit 1
+              }
 
               Write-Host "Installing Tailscale..."
 
@@ -175,7 +224,10 @@ jobs:
                   exit 1
               }
 
-              Remove-Item $installer -Force -ErrorAction SilentlyContinue
+              Remove-Item `
+                -Path $installer `
+                -Force `
+                -ErrorAction SilentlyContinue
           }
 
           if (-not (Test-Path $tailscale)) {
@@ -196,11 +248,16 @@ jobs:
           Write-Host "=== Configuring Tailscale ==="
 
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-              Write-Error "TAILSCALE_AUTH_KEY GitHub secret is not configured."
+              Write-Error "TAILSCALE_AUTH_KEY GitHub Secret is not configured."
               exit 1
           }
 
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+              Write-Error "Tailscale executable not found."
+              exit 1
+          }
 
           & $tailscale up `
             --authkey="$env:TAILSCALE_AUTH_KEY" `
@@ -212,7 +269,7 @@ jobs:
               exit 1
           }
 
-          Write-Host "Tailscale configured."
+          Write-Host "Tailscale configured successfully."
 
       # ------------------------------------------------------------
       # 6. Get Tailscale IPv4
@@ -231,9 +288,12 @@ jobs:
               $output = & $tailscale ip -4 2>$null
 
               if ($output) {
-                  $tsIP = ($output |
-                    Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
-                    Select-Object -First 1)
+
+                  $tsIP = $output |
+                    Where-Object {
+                        $_ -match '^\d{1,3}(\.\d{1,3}){3}$'
+                    } |
+                    Select-Object -First 1
               }
 
               if ($tsIP) {
@@ -249,11 +309,14 @@ jobs:
               exit 1
           }
 
+          $tsIP = $tsIP.ToString().Trim()
+
           Write-Host "Tailscale IPv4: $tsIP"
 
-          "TAILSCALE_IP=$tsIP" | Out-File `
-            -FilePath $env:GITHUB_ENV `
-            -Append
+          "TAILSCALE_IP=$tsIP" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append
 
       # ------------------------------------------------------------
       # 7. Verify RDP service
@@ -265,7 +328,7 @@ jobs:
 
           $service = Get-Service -Name TermService
 
-          Write-Host "Status: $($service.Status)"
+          Write-Host "Status:    $($service.Status)"
           Write-Host "StartType: $($service.StartType)"
 
           if ($service.Status -ne "Running") {
@@ -273,8 +336,10 @@ jobs:
               exit 1
           }
 
+          Write-Host "TermService is running."
+
       # ------------------------------------------------------------
-      # 8. Verify RDP port locally
+      # 8. Verify local RDP port
       # ------------------------------------------------------------
       - name: Verify RDP port
         shell: powershell
@@ -294,7 +359,30 @@ jobs:
           Write-Host "RDP port 3389 is listening."
 
       # ------------------------------------------------------------
-      # 9. Display connection information
+      # 9. Verify Tailscale connection
+      # ------------------------------------------------------------
+      - name: Verify Tailscale connection
+        shell: powershell
+        run: |
+          Write-Host "=== Verifying Tailscale ==="
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          $status = & $tailscale status 2>&1
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Tailscale status check failed."
+              Write-Host $status
+              exit 1
+          }
+
+          Write-Host $status
+
+          Write-Host ""
+          Write-Host "Tailscale IPv4: $env:TAILSCALE_IP"
+
+      # ------------------------------------------------------------
+      # 10. Display connection information
       # ------------------------------------------------------------
       - name: Show LaorORG connection
         shell: powershell
@@ -312,7 +400,7 @@ jobs:
           Write-Host ""
 
       # ------------------------------------------------------------
-      # 10. Keep runner alive
+      # 11. Keep workflow alive
       # ------------------------------------------------------------
       - name: Keep LaorORG runner active
         shell: powershell
