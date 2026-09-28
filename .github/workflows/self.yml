@@ -5,13 +5,40 @@ on:
 
 jobs:
   secure-LaorORG:
-    runs-on: self-hosted
+    runs-on: [self-hosted, Windows, LaorORG]
 
     timeout-minutes: 3600
 
     steps:
+
       # ------------------------------------------------------------
-      # 1. Configure Windows Remote Desktop
+      # 1. Verify runner has Administrator privileges
+      # ------------------------------------------------------------
+      - name: Verify administrator privileges
+        shell: powershell
+        run: |
+          Write-Host "=== Checking administrator privileges ==="
+
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+
+          $isAdmin = $principal.IsInRole(
+              [Security.Principal.WindowsBuiltInRole]::Administrator
+          )
+
+          Write-Host "Running as: $($identity.Name)"
+          Write-Host "Administrator: $isAdmin"
+
+          if (-not $isAdmin) {
+              Write-Error "GitHub Actions runner is NOT running with Administrator privileges."
+              Write-Error "Configure the self-hosted runner service to run with an elevated account."
+              exit 1
+          }
+
+          Write-Host "Administrator privileges confirmed."
+
+      # ------------------------------------------------------------
+      # 2. Configure Windows Remote Desktop
       # ------------------------------------------------------------
       - name: Configure RDP
         shell: powershell
@@ -25,57 +52,57 @@ jobs:
             -Value 0 `
             -Force
 
-          # KEEP Network Level Authentication enabled
+          # Keep Network Level Authentication enabled
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' `
             -Value 1 `
             -Force
 
-          # Use standard RDP security layer
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'SecurityLayer' `
-            -Value 1 `
-            -Force
-
-          # Make sure TermService starts automatically
+          # Configure TermService
           Set-Service `
             -Name 'TermService' `
             -StartupType Automatic
 
-          # Start RDP service
           Start-Service -Name 'TermService'
 
-          # Enable Windows Firewall RDP rules
+          # Enable built-in Remote Desktop firewall rules
           Enable-NetFirewallRule `
             -DisplayGroup 'Remote Desktop'
 
           Write-Host "RDP configuration completed."
 
       # ------------------------------------------------------------
-      # 2. Configure existing runneradmin account
+      # 3. Configure runneradmin
       # ------------------------------------------------------------
       - name: Configure runneradmin
         shell: powershell
+        env:
+          RUNNERADMIN_PASSWORD: ${{ secrets.RUNNERADMIN_PASSWORD }}
         run: |
           Write-Host "=== Configuring runneradmin ==="
 
           $username = "runneradmin"
-          $password = "Laor@001"
 
-          # Verify existing account
-          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
-
-          if (-not $user) {
-              Write-Error "The Windows user '$username' does not exist."
-              Write-Error "Create runneradmin on the Windows machine first."
+          if ([string]::IsNullOrWhiteSpace($env:RUNNERADMIN_PASSWORD)) {
+              Write-Error "RUNNERADMIN_PASSWORD GitHub secret is not configured."
               exit 1
           }
 
-          # Set password
+          # Verify account exists
+          $user = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if (-not $user) {
+              Write-Error "Windows user '$username' does not exist."
+              Write-Error "Create the account on the Windows machine first."
+              exit 1
+          }
+
+          # Set password from GitHub Secret
           $securePassword = ConvertTo-SecureString `
-            $password `
+            $env:RUNNERADMIN_PASSWORD `
             -AsPlainText `
             -Force
 
@@ -83,42 +110,39 @@ jobs:
             -Name $username `
             -Password $securePassword
 
-          # Make sure account is enabled
+          # Enable account
           Enable-LocalUser -Name $username
 
-          # Password does not expire
+          # Password never expires
           Set-LocalUser `
             -Name $username `
             -PasswordNeverExpires $true
 
           # Add to Remote Desktop Users
-          $rdpGroup = Get-LocalGroup `
-            -Name "Remote Desktop Users" `
-            -ErrorAction SilentlyContinue
+          $memberExists = Get-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -match "\\$([regex]::Escape($username))$"
+            }
 
-          if ($rdpGroup) {
-              $member = Get-LocalGroupMember `
+          if (-not $memberExists) {
+              Add-LocalGroupMember `
                 -Group "Remote Desktop Users" `
-                -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.Name -match "\\$username$"
-                }
-
-              if (-not $member) {
-                  Add-LocalGroupMember `
-                    -Group "Remote Desktop Users" `
-                    -Member $username
-              }
+                -Member $username
           }
 
-          # Verify account
-          Get-LocalUser -Name $username |
-            Select-Object Name, Enabled, PasswordExpires
+          # Verify without displaying password
+          $verify = Get-LocalUser -Name $username
+
+          Write-Host "Username: $($verify.Name)"
+          Write-Host "Enabled: $($verify.Enabled)"
+          Write-Host "Password expires: $($verify.PasswordExpires)"
 
           Write-Host "runneradmin configured."
 
       # ------------------------------------------------------------
-      # 3. Install / update Tailscale
+      # 4. Install Tailscale
       # ------------------------------------------------------------
       - name: Install Tailscale
         shell: powershell
@@ -132,27 +156,37 @@ jobs:
               $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
               $installer = "$env:TEMP\tailscale.msi"
 
+              Write-Host "Downloading Tailscale..."
+
               Invoke-WebRequest `
                 -Uri $url `
                 -OutFile $installer
 
-              Start-Process `
+              Write-Host "Installing Tailscale..."
+
+              $process = Start-Process `
                 -FilePath "msiexec.exe" `
                 -ArgumentList "/i `"$installer`" /quiet /norestart" `
-                -Wait
+                -Wait `
+                -PassThru
 
-              Remove-Item $installer -Force
+              if ($process.ExitCode -ne 0) {
+                  Write-Error "Tailscale installation failed with exit code $($process.ExitCode)."
+                  exit 1
+              }
+
+              Remove-Item $installer -Force -ErrorAction SilentlyContinue
           }
 
           if (-not (Test-Path $tailscale)) {
-              Write-Error "Tailscale installation failed."
+              Write-Error "Tailscale executable was not found."
               exit 1
           }
 
           Write-Host "Tailscale installed."
 
       # ------------------------------------------------------------
-      # 4. Enable Tailscale unattended mode
+      # 5. Configure Tailscale
       # ------------------------------------------------------------
       - name: Configure Tailscale
         shell: powershell
@@ -161,9 +195,13 @@ jobs:
         run: |
           Write-Host "=== Configuring Tailscale ==="
 
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              Write-Error "TAILSCALE_AUTH_KEY GitHub secret is not configured."
+              exit 1
+          }
+
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          # Authenticate / configure the machine
           & $tailscale up `
             --authkey="$env:TAILSCALE_AUTH_KEY" `
             --hostname="LaorORG" `
@@ -174,15 +212,15 @@ jobs:
               exit 1
           }
 
-          Write-Host "Tailscale unattended mode enabled."
+          Write-Host "Tailscale configured."
 
       # ------------------------------------------------------------
-      # 5. Get Tailscale IP
+      # 6. Get Tailscale IPv4
       # ------------------------------------------------------------
       - name: Get Tailscale IP
         shell: powershell
         run: |
-          Write-Host "=== Getting Tailscale IP ==="
+          Write-Host "=== Getting Tailscale IPv4 ==="
 
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
@@ -190,7 +228,13 @@ jobs:
 
           for ($i = 1; $i -le 30; $i++) {
 
-              $tsIP = (& $tailscale ip -4 2>$null | Select-Object -First 1).Trim()
+              $output = & $tailscale ip -4 2>$null
+
+              if ($output) {
+                  $tsIP = ($output |
+                    Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
+                    Select-Object -First 1)
+              }
 
               if ($tsIP) {
                   break
@@ -207,31 +251,50 @@ jobs:
 
           Write-Host "Tailscale IPv4: $tsIP"
 
-          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          "TAILSCALE_IP=$tsIP" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append
 
       # ------------------------------------------------------------
-      # 6. Verify RDP
+      # 7. Verify RDP service
       # ------------------------------------------------------------
-      - name: Verify RDP
+      - name: Verify RDP service
         shell: powershell
         run: |
-          Write-Host "=== Testing RDP ==="
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "=== Verifying RDP service ==="
+
+          $service = Get-Service -Name TermService
+
+          Write-Host "Status: $($service.Status)"
+          Write-Host "StartType: $($service.StartType)"
+
+          if ($service.Status -ne "Running") {
+              Write-Error "TermService is not running."
+              exit 1
+          }
+
+      # ------------------------------------------------------------
+      # 8. Verify RDP port locally
+      # ------------------------------------------------------------
+      - name: Verify RDP port
+        shell: powershell
+        run: |
+          Write-Host "=== Testing local RDP port ==="
 
           $result = Test-NetConnection `
-            -ComputerName $env:TAILSCALE_IP `
+            -ComputerName "127.0.0.1" `
             -Port 3389 `
             -WarningAction SilentlyContinue
 
           if (-not $result.TcpTestSucceeded) {
-              Write-Error "RDP port 3389 is not reachable."
+              Write-Error "RDP port 3389 is not listening."
               exit 1
           }
 
-          Write-Host "RDP port 3389 is reachable."
+          Write-Host "RDP port 3389 is listening."
 
       # ------------------------------------------------------------
-      # 7. Display connection information
+      # 9. Display connection information
       # ------------------------------------------------------------
       - name: Show LaorORG connection
         shell: powershell
@@ -242,13 +305,14 @@ jobs:
           Write-Host "=========================================="
           Write-Host "Tailscale IP : $env:TAILSCALE_IP"
           Write-Host "Username     : runneradmin"
-          Write-Host "Password     : Laor@001"
           Write-Host "RDP Port     : 3389"
           Write-Host "=========================================="
           Write-Host ""
+          Write-Host "Password is stored in GitHub Secrets."
+          Write-Host ""
 
       # ------------------------------------------------------------
-      # 8. Keep workflow alive
+      # 10. Keep runner alive
       # ------------------------------------------------------------
       - name: Keep LaorORG runner active
         shell: powershell
